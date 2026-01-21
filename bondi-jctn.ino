@@ -1,6 +1,6 @@
 /*
  * Sydney Trains - Bondi Junction Departures
- * FIXED VERSION
+ * Enhanced with minutes to departure, filtering, and button control
  */
 
 #include <WiFi.h>
@@ -9,6 +9,7 @@
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
+#include <time.h>
 
 // ===== WiFi Credentials =====
 const char* ssid = "ssid";        
@@ -16,6 +17,7 @@ const char* password = "password";
 
 // ===== Transport NSW API =====
 const char* apiKey = "key";
+const char* stopID = "202210";  // Stop ID for Bondi Junction
 
 // ===== OLED Pins =====
 #define OLED_SCK   18
@@ -23,6 +25,9 @@ const char* apiKey = "key";
 #define OLED_CS    15
 #define OLED_DC    4
 #define OLED_RST   5
+
+// ===== Button Pin =====
+#define BUTTON_PIN 13  // GPIO13 on ESP32-WROVER-CAM
 
 // ===== Colors =====
 #define BLACK      0x0000
@@ -34,24 +39,79 @@ const char* apiKey = "key";
 #define YELLOW     0xFFE0
 #define WHITE      0xFFFF
 #define ORANGE     0xFD20
+#define DARK_GRAY  0x2945
 
 // ===== OLED Display =====
 Adafruit_SSD1351 oled = Adafruit_SSD1351(128, 128, OLED_CS, OLED_DC, OLED_MOSI, OLED_SCK, OLED_RST);
+
+// ===== Time Zone Offset (AEDT = UTC+11) =====
+const int UTC_OFFSET_HOURS = 11;
+
+// ===== Button debounce and mode =====
+unsigned long lastButtonPress = 0;
+const unsigned long DEBOUNCE_DELAY = 200;
+int displayMode = 0;  // 0 = Trains, 1 = Buses, 2 = All
+const char* modeNames[] = {"TRAINS", "BUSES", "ALL"};
+
+// ===== Departure types =====
+#define TYPE_TRAIN 0
+#define TYPE_BUS 1
+#define TYPE_OTHER 2
 
 // Structure to hold departure info
 struct Departure {
   String destination;
   String platform;
   String time;
+  String route;
   int minutesUntil;
+  int delayMinutes;     // ← NEW: negative = early, 0 = on time, positive = late
+  int type;  // 0=train, 1=bus
   bool valid;
 };
+
+Departure allDepartures[30];
+int totalCount = 0;
+unsigned long lastFetchTime = 0;
+const unsigned long FETCH_INTERVAL = 10000;  // Refresh every 10 seconds
+
+// Function to convert stop ID to station name
+String getStationName(const char* stopID) {
+  if (strcmp(stopID, "207053") == 0) return "BONDI JUNCTION";
+  if (strcmp(stopID, "207210") == 0) return "TURRAMURRA";
+  if (strcmp(stopID, "207020") == 0) return "CENTRAL";
+  if (strcmp(stopID, "207029") == 0) return "REDFERN";
+  if (strcmp(stopID, "207037") == 0) return "MAROUBRA";
+  if (strcmp(stopID, "207006") == 0) return "TOWN HALL";
+  if (strcmp(stopID, "207014") == 0) return "COOGEE";
+  if (strcmp(stopID, "207046") == 0) return "CRONULLA";
+  if (strcmp(stopID, "207007") == 0) return "WYNYARD";
+  if (strcmp(stopID, "207010") == 0) return "EDGECLIFF";
+  if (strcmp(stopID, "207011") == 0) return "WATSONS BAY";
+  if (strcmp(stopID, "207015") == 0) return "TAMARAMA";
+  if (strcmp(stopID, "207016") == 0) return "BRONTE";
+  if (strcmp(stopID, "207017") == 0) return "WAVERLEY";
+  return "STATION";
+}
+
+// Function to classify transport type by route name
+int classifyTransport(String route) {
+  if (route.length() > 0) {
+    char first = route[0];
+    if (first == 'T' || first == 't') return TYPE_TRAIN;
+    if (isdigit(first)) return TYPE_BUS;
+  }
+  return TYPE_OTHER;
+}
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
   
   Serial.println("\n=== BONDI JUNCTION DEPARTURES ===");
+  
+  // Initialize button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
   
   // Initialize OLED
   oled.begin();
@@ -79,6 +139,9 @@ void setup() {
     Serial.println("\nConnected!");
     Serial.println("IP: " + WiFi.localIP().toString());
     
+    // Set time from NTP
+    configTime(UTC_OFFSET_HOURS * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    
     oled.fillScreen(BLACK);
     oled.setCursor(20, 50);
     oled.setTextColor(GREEN);
@@ -95,20 +158,42 @@ void setup() {
 }
 
 void loop() {
-  getDepartures();
-  delay(30000);  // Refresh every 30 seconds
+  // Check button press
+  checkButton();
+  
+  // Fetch departures at interval
+  unsigned long now = millis();
+  if (now - lastFetchTime > FETCH_INTERVAL) {
+    getDepartures();
+    lastFetchTime = now;
+    displayDepartures();
+  }
+  
+  delay(50);
+}
+
+void checkButton() {
+  if (digitalRead(BUTTON_PIN) == LOW) {  // Button pressed (active low)
+    unsigned long now = millis();
+    if (now - lastButtonPress > DEBOUNCE_DELAY) {
+      lastButtonPress = now;
+      displayMode = (displayMode + 1) % 3;
+      Serial.println("Mode switched to: " + String(modeNames[displayMode]));
+      displayDepartures();
+    }
+  }
 }
 
 void getDepartures() {
   HTTPClient http;
   
-  // CORRECT API call for Bondi Junction departures
+  // API call for Bondi Junction departures
   String url = "https://api.transport.nsw.gov.au/v1/tp/departure_mon";
   url += "?outputFormat=rapidJSON";
   url += "&coordOutputFormat=EPSG%3A4326";
   url += "&mode=direct";
   url += "&type_dm=stop";
-  url += "&name_dm=207410";  // BONDI JUNCTION CORRECT STOP ID
+  url += "&name_dm=" + String(stopID);
   url += "&departureMonitorMacro=true";
   url += "&TfNSWDM=true";
   url += "&version=10.2.1.42";
@@ -141,13 +226,12 @@ void getDepartures() {
   }
   
   // Extract departures into array
-  Departure departures[10];
-  int depCount = 0;
+  totalCount = 0;
   
   // Check if we have stopEvents
   if (!doc["stopEvents"].is<JsonArray>()) {
     Serial.println("No stopEvents found");
-    showError("No Data");
+    totalCount = 0;
     return;
   }
   
@@ -155,123 +239,150 @@ void getDepartures() {
   Serial.println("Found " + String(stopEvents.size()) + " events");
   
   // Get current time for calculating minutes
-  unsigned long currentMillis = millis();
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  int currentHour = timeinfo->tm_hour;
+  int currentMin = timeinfo->tm_min;
+  int currentTotalMin = currentHour * 60 + currentMin;
   
   for (JsonVariant eventVar : stopEvents) {
-    if (depCount >= 10) break;
+    if (totalCount >= 30) break;
     
     JsonObject event = eventVar.as<JsonObject>();
     Departure dep;
     dep.valid = false;
+    dep.route = "";
+    dep.platform = "";
+    dep.type = TYPE_OTHER;
     
-    // Get transportation info
+    // Determine transport type
     if (event["transportation"].is<JsonObject>()) {
       JsonObject transport = event["transportation"].as<JsonObject>();
+      
+      // Check type (train vs bus)
+      if (transport["properties"]["DM_TransportType"].is<const char*>()) {
+        String transType = transport["properties"]["DM_TransportType"].as<String>();
+        if (transType.indexOf("Train") != -1 || transType.indexOf("train") != -1) {
+          dep.type = TYPE_TRAIN;
+        } else if (transType.indexOf("Bus") != -1 || transType.indexOf("bus") != -1) {
+          dep.type = TYPE_BUS;
+        }
+      }
       
       // Destination
       if (transport["destination"]["name"].is<const char*>()) {
         dep.destination = transport["destination"]["name"].as<String>();
         dep.destination.replace(" Station", "");
+        dep.destination.trim();
       }
       
-      // Platform
+      // Get route type (line name/number)
+      if (transport["disassembledName"].is<const char*>()) {
+        dep.route = transport["disassembledName"].as<String>();
+      } else if (transport["number"].is<const char*>()) {
+        dep.route = transport["number"].as<String>();
+      }
+      
+      // Classify by route name (T = train, numbers = bus)
+      int routeClassify = classifyTransport(dep.route);
+      if (routeClassify != TYPE_OTHER) {
+        dep.type = routeClassify;
+      }
+      
+      // Platform - check multiple locations
       if (transport["properties"]["PlatformName"].is<const char*>()) {
         dep.platform = transport["properties"]["PlatformName"].as<String>();
-      } else {
-        dep.platform = "?";
+      } else if (event["platformName"].is<const char*>()) {
+        dep.platform = event["platformName"].as<String>();
+      } else if (transport["platform"].is<const char*>()) {
+        dep.platform = transport["platform"].as<String>();
+      }
+      
+      // Clean platform - remove letters, keep only numbers
+      if (dep.platform.length() > 0) {
+        String cleanPlatform = "";
+        for (int i = 0; i < dep.platform.length(); i++) {
+          if (isdigit(dep.platform[i])) {
+            cleanPlatform += dep.platform[i];
+          }
+        }
+        if (cleanPlatform.length() > 0) {
+          dep.platform = cleanPlatform;
+        }
       }
     }
     
-    // Get departure time
-    String timeStr = "";
+    // Get departure times (planned and estimated) for delay calculation
+    String timeEstimated = "";
+    String timePlanned = "";
+    
     if (event["departureTimeEstimated"].is<const char*>()) {
-      timeStr = event["departureTimeEstimated"].as<String>();
-    } else if (event["departureTimePlanned"].is<const char*>()) {
-      timeStr = event["departureTimePlanned"].as<String>();
+      timeEstimated = event["departureTimeEstimated"].as<String>();
     }
+    if (event["departureTimePlanned"].is<const char*>()) {
+      timePlanned = event["departureTimePlanned"].as<String>();
+    }
+    
+    // Use estimated if available, otherwise planned
+    String timeStr = timeEstimated.length() > 0 ? timeEstimated : timePlanned;
     
     if (timeStr.length() >= 16) {
-      dep.time = timeStr.substring(11, 16);  // Extract HH:MM
-      dep.valid = true;
-      
-      // Calculate minutes until departure (rough estimate)
+      // Parse UTC time and convert to AEDT
       int hour = timeStr.substring(11, 13).toInt();
       int minute = timeStr.substring(14, 16).toInt();
-      // This is simplified - just for sorting
-      dep.minutesUntil = hour * 60 + minute;
+      
+      // Convert UTC to AEDT (UTC+11)
+      hour = (hour + UTC_OFFSET_HOURS) % 24;
+      
+      // Format time as HH:MM
+      char timeBuffer[6];
+      sprintf(timeBuffer, "%02d:%02d", hour, minute);
+      dep.time = String(timeBuffer);
+      
+      // Calculate minutes until departure
+      int depTotalMin = hour * 60 + minute;
+      dep.minutesUntil = depTotalMin - currentTotalMin;
+      if (dep.minutesUntil < 0) {
+        dep.minutesUntil += 1440;  // Next day
+      }
+      
+      // Calculate delay (estimated vs planned)
+      dep.delayMinutes = 0;
+      if (timeEstimated.length() >= 16 && timePlanned.length() >= 16) {
+        int estHour = timeEstimated.substring(11, 13).toInt();
+        int estMin = timeEstimated.substring(14, 16).toInt();
+        int planHour = timePlanned.substring(11, 13).toInt();
+        int planMin = timePlanned.substring(14, 16).toInt();
+        
+        int estTotal = estHour * 60 + estMin;
+        int planTotal = planHour * 60 + planMin;
+        dep.delayMinutes = estTotal - planTotal;  // positive = late, negative = early
+      }
+      
+      dep.valid = true;
     }
     
-    if (dep.valid && dep.destination.length() > 0) {
-      departures[depCount] = dep;
-      depCount++;
+    if (dep.valid && dep.destination.length() > 0 && dep.minutesUntil >= 0) {
+      allDepartures[totalCount] = dep;
+      totalCount++;
       
-      Serial.println(dep.destination + " @ " + dep.time + " Platform " + dep.platform);
+      String typeStr = (dep.type == TYPE_TRAIN) ? "TRAIN" : (dep.type == TYPE_BUS) ? "BUS" : "OTHER";
+      Serial.println(typeStr + ": " + dep.route + " to " + dep.destination + " @ " + dep.time + " (in " + dep.minutesUntil + " min) Platform " + dep.platform);
     }
   }
   
-  // Sort by time
-  for (int i = 0; i < depCount - 1; i++) {
-    for (int j = i + 1; j < depCount; j++) {
-      if (departures[j].minutesUntil < departures[i].minutesUntil) {
-        Departure temp = departures[i];
-        departures[i] = departures[j];
-        departures[j] = temp;
+  // Sort by minutes until departure
+  for (int i = 0; i < totalCount - 1; i++) {
+    for (int j = i + 1; j < totalCount; j++) {
+      if (allDepartures[j].minutesUntil < allDepartures[i].minutesUntil) {
+        Departure temp = allDepartures[i];
+        allDepartures[i] = allDepartures[j];
+        allDepartures[j] = temp;
       }
     }
   }
   
-  // Display on screen
-  oled.fillScreen(BLACK);
-  
-  // Header
-  oled.fillRect(0, 0, 128, 13, BLUE);
-  oled.setCursor(2, 3);
-  oled.setTextColor(WHITE);
-  oled.setTextSize(1);
-  oled.println("BONDI JUNCTION");
-  
-  // Show departures
-  int yPos = 16;
-  int displayCount = min(depCount, 5);
-  
-  for (int i = 0; i < displayCount; i++) {
-    Departure dep = departures[i];
-    
-    // Truncate destination if too long
-    String dest = dep.destination;
-    if (dest.length() > 16) {
-      dest = dest.substring(0, 16);
-    }
-    
-    // Line 1: Destination
-    oled.setCursor(2, yPos);
-    oled.setTextColor(WHITE);
-    oled.setTextSize(1);
-    oled.println(dest);
-    
-    // Line 2: Time and Platform
-    oled.setCursor(2, yPos + 9);
-    oled.setTextColor(CYAN);
-    oled.print(dep.time);
-    
-    oled.setTextColor(YELLOW);
-    oled.print("  Plat ");
-    oled.setTextColor(GREEN);
-    oled.println(dep.platform);
-    
-    // Separator
-    oled.drawFastHLine(0, yPos + 20, 128, BLUE);
-    
-    yPos += 22;
-  }
-  
-  if (depCount == 0) {
-    oled.setCursor(15, 60);
-    oled.setTextColor(YELLOW);
-    oled.println("No departures");
-  }
-  
-  Serial.println("Displayed " + String(displayCount) + " trains");
+  Serial.println("Total parsed: " + String(totalCount));
 }
 
 void showError(String msg) {
@@ -280,4 +391,113 @@ void showError(String msg) {
   oled.setTextColor(RED);
   oled.setTextSize(1);
   oled.println(msg);
+}
+
+void displayDepartures() {
+  // Filter departures based on mode
+  Departure filtered[30];
+  int filteredCount = 0;
+  
+  for (int i = 0; i < totalCount; i++) {
+    if (displayMode == 0 && allDepartures[i].type == TYPE_TRAIN) {
+      filtered[filteredCount++] = allDepartures[i];
+    } else if (displayMode == 1 && allDepartures[i].type == TYPE_BUS) {
+      filtered[filteredCount++] = allDepartures[i];
+    } else if (displayMode == 2) {
+      filtered[filteredCount++] = allDepartures[i];
+    }
+  }
+  
+  // Display on screen
+  oled.fillScreen(BLACK);
+  
+  // Header with mode indicator
+  oled.fillRect(0, 0, 128, 14, BLUE);
+  oled.setCursor(2, 3);
+  oled.setTextColor(WHITE);
+  oled.setTextSize(1);
+  String stationName = getStationName(stopID);
+  oled.print(stationName);
+  oled.print(" ");
+  oled.setTextColor(YELLOW);
+  oled.println(modeNames[displayMode]);
+  
+  if (filteredCount == 0) {
+    oled.setCursor(15, 60);
+    oled.setTextColor(YELLOW);
+    oled.setTextSize(1);
+    oled.println("No departures");
+    return;
+  }
+  
+  // Show departures
+  int yPos = 16;
+  int displayCount = min(filteredCount, 4);
+  
+  for (int i = 0; i < displayCount; i++) {
+    Departure dep = filtered[i];
+    
+    // Line 1: Route and Destination (use full width)
+    String dest = dep.destination;
+    // Allow up to 20 chars (almost full width) for destination
+    if (dest.length() > 20) {
+      dest = dest.substring(0, 20);
+    }
+    
+    // Color based on delay status
+    int color = GREEN;  // On time
+    if (dep.delayMinutes < 0) color = BLUE;       // Early
+    else if (dep.delayMinutes > 0 && dep.delayMinutes <= 2) color = ORANGE;  // 1-2 min late
+    else if (dep.delayMinutes > 2) color = RED;   // 3+ min late
+    
+    oled.setCursor(2, yPos);
+    oled.setTextColor(color);
+    oled.setTextSize(1);
+    if (dep.route.length() > 0) {
+      oled.print(dep.route);
+      oled.print(" ");
+    }
+    oled.println(dest);
+    
+    // Line 2: Minutes, Status/Delay, and Platform
+    oled.setCursor(2, yPos + 9);
+    oled.setTextColor(color);
+    
+    // Show time status
+    if (dep.minutesUntil == 0) {
+      oled.print("Now");
+    } else {
+      oled.print(dep.minutesUntil);
+      oled.print("m");
+    }
+    
+    // Show delay status
+    if (dep.delayMinutes != 0) {
+      if (dep.delayMinutes < 0) {
+        oled.print(" +");
+        oled.print(abs(dep.delayMinutes));
+      } else {
+        oled.print(" -");
+        oled.print(dep.delayMinutes);
+      }
+    }
+    
+    // Platform
+    if (dep.platform.length() > 0) {
+      oled.setTextColor(WHITE);
+      oled.print("  P");
+      oled.print(dep.platform);
+    } else {
+      oled.setTextColor(MAGENTA);
+      oled.print("  TBA");
+    }
+    oled.println();
+    
+    // Separator
+    oled.drawFastHLine(0, yPos + 20, 128, DARK_GRAY);
+    
+    yPos += 22;
+  }
+  
+  Serial.println("Displayed " + String(displayCount) + " departures in " + String(modeNames[displayMode]) + " mode");
 }
