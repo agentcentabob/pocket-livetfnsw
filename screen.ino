@@ -34,8 +34,8 @@ const int UTC_OFFSET_HOURS = 11;
 // button debounce and mode
 unsigned long lastButtonPress = 0;
 const unsigned long DEBOUNCE_DELAY = 200;
-int displayMode = 1;
-const char* modeNames[] = {"ALL", "TRAINS", "BUSES", "LR", "FERRY", "OTHER"};
+int displayMode = 0;
+const char* modeNames[] = {"ALL MODES", "RAIL", "BUSES", "LIGHT RAIL", "FERRY"};
 
 // departure types
 #define TYPE_ALL 0
@@ -43,7 +43,6 @@ const char* modeNames[] = {"ALL", "TRAINS", "BUSES", "LR", "FERRY", "OTHER"};
 #define TYPE_BUS 2
 #define TYPE_LR 3
 #define TYPE_FERRY 4
-#define TYPE_OTHER 5
 
 // structure to hold departure info
 struct Departure {
@@ -61,34 +60,17 @@ Departure allDepartures[30];
 int totalCount = 0;
 unsigned long lastFetchTime = 0;
 const unsigned long FETCH_INTERVAL = 10000;  // refreshes every 10 seconds
+String currentStationName = "";  // Store station name from API
 
-// TO REPLACE WITH API PULL
+// station name lookup
 String getStationName(const char* stopID) {
-  if (strcmp(stopID, "207053") == 0) return "BONDI JUNCTION";
-  if (strcmp(stopID, "207210") == 0) return "TURRAMURRA";
-  if (strcmp(stopID, "207020") == 0) return "CENTRAL";
-  if (strcmp(stopID, "207029") == 0) return "REDFERN";
-  if (strcmp(stopID, "207037") == 0) return "MAROUBRA";
-  if (strcmp(stopID, "207006") == 0) return "TOWN HALL";
-  if (strcmp(stopID, "207014") == 0) return "COOGEE";
-  if (strcmp(stopID, "207046") == 0) return "CRONULLA";
-  if (strcmp(stopID, "207007") == 0) return "WYNYARD";
-  if (strcmp(stopID, "207010") == 0) return "EDGECLIFF";
-  if (strcmp(stopID, "207011") == 0) return "WATSONS BAY";
-  if (strcmp(stopID, "207015") == 0) return "TAMARAMA";
-  if (strcmp(stopID, "207016") == 0) return "BRONTE";
-  if (strcmp(stopID, "207017") == 0) return "WAVERLEY";
-  return "STATION";
-}
-
-// TO REPLACE WITH API PULL
-int classifyTransport(String route) {
-  if (route.length() > 0) {
-    char first = route[0];
-    if (first == 'T' || first == 't') return TYPE_RAIL;
-    if (isdigit(first)) return TYPE_BUS;
+  // Use API-provided name if we have it
+  if (currentStationName.length() > 0) {
+    return currentStationName;
   }
-  return TYPE_OTHER;
+  
+  // Fallback to stop ID
+  return "#" + String(stopID);
 }
 
 void setup() {
@@ -164,7 +146,7 @@ void checkButton() {
     unsigned long now = millis();
     if (now - lastButtonPress > DEBOUNCE_DELAY) {
       lastButtonPress = now;
-      displayMode = (displayMode + 1) % 5;
+      displayMode = (displayMode + 1) % 5;  // 5 modes
       Serial.println("Mode switched to: " + String(modeNames[displayMode]));
       displayDepartures();
     }
@@ -186,8 +168,10 @@ void getDepartures() {
   url += "&version=10.2.1.42";
   
   Serial.println("\n=== Fetching Departures ===");
+  Serial.println("Stop ID: " + String(stopID));
   
   http.begin(url);
+  http.setTimeout(15000);
   http.addHeader("Authorization", String("apikey ") + apiKey);
   
   int httpCode = http.GET();
@@ -202,22 +186,49 @@ void getDepartures() {
   String payload = http.getString();
   http.end();
   
+  Serial.println("Payload size: " + String(payload.length()) + " bytes");
+  
   // parse json
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, payload);
   
   if (error) {
-    Serial.println("JSON Parse Error");
+    Serial.println("JSON Parse Error: " + String(error.c_str()));
+    Serial.println("Error code: " + String(error.code()));
     showError("Parse Error");
     return;
   }
   
-  // extract departures into array
-  totalCount = 0;
+  // Extract station name from locations if available
+  if (doc["locations"].is<JsonArray>()) {
+    JsonArray locations = doc["locations"].as<JsonArray>();
+    if (locations.size() > 0 && locations[0]["disassembledName"].is<const char*>()) {
+      String stationNameFromAPI = locations[0]["disassembledName"].as<String>();
+      stationNameFromAPI.replace(" Station", "");
+      stationNameFromAPI.toUpperCase();
+      currentStationName = stationNameFromAPI;
+      Serial.println("Station name from API: " + currentStationName);
+    }
+  }
   
   // check for stopEvents
   if (!doc["stopEvents"].is<JsonArray>()) {
-    Serial.println("No stopEvents found");
+    Serial.println("No stopEvents found in response");
+    
+    // Display station name even with no departures
+    if (currentStationName.length() > 0) {
+      oled.fillScreen(BLACK);
+      oled.setCursor(2, 3);
+      oled.setTextColor(WHITE);
+      oled.setTextSize(1);
+      oled.print(currentStationName);
+      oled.setCursor(15, 60);
+      oled.setTextColor(YELLOW);
+      oled.println("No departures");
+    } else {
+      showError("No departures");
+    }
+    
     totalCount = 0;
     return;
   }
@@ -232,6 +243,11 @@ void getDepartures() {
   int currentMin = timeinfo->tm_min;
   int currentTotalMin = currentHour * 60 + currentMin;
   
+  Serial.println("Current time: " + String(currentHour) + ":" + String(currentMin));
+  
+  // extract departures into array
+  totalCount = 0;
+  
   for (JsonVariant eventVar : stopEvents) {
     if (totalCount >= 30) break;
     
@@ -240,40 +256,48 @@ void getDepartures() {
     dep.valid = false;
     dep.route = "";
     dep.platform = "";
-    dep.type = TYPE_OTHER;
+    dep.type = TYPE_BUS;
     
-    // determine transport type
+    // determine transport type using API product class
     if (event["transportation"].is<JsonObject>()) {
       JsonObject transport = event["transportation"].as<JsonObject>();
       
-      // check type (train vs bus)
-      if (transport["properties"]["DM_TransportType"].is<const char*>()) {
-        String transType = transport["properties"]["DM_TransportType"].as<String>();
-        if (transType.indexOf("Train") != -1 || transType.indexOf("train") != -1) {
-          dep.type = TYPE_RAIL;
-        } else if (transType.indexOf("Bus") != -1 || transType.indexOf("bus") != -1) {
-          dep.type = TYPE_BUS;
+      // Try to get product class first (most reliable)
+      if (transport["product"].is<JsonObject>()) {
+        JsonObject product = transport["product"].as<JsonObject>();
+        if (product["class"].is<int>()) {
+          int productClass = product["class"].as<int>();
+          // TfNSW product classes: 1=Train, 5=Bus, 4=Ferry, 7=Light Rail
+          if (productClass == 1) dep.type = TYPE_RAIL;
+          else if (productClass == 5) dep.type = TYPE_BUS;
+          else if (productClass == 4) dep.type = TYPE_FERRY;
+          else if (productClass == 7) dep.type = TYPE_LR;
         }
       }
       
-      // desto
+      // Fallback to transport mode name if product class not available
+      if (dep.type == TYPE_BUS && transport["properties"]["DM_TransportType"].is<const char*>()) {
+        String transType = transport["properties"]["DM_TransportType"].as<String>();
+        transType.toLowerCase();
+        if (transType.indexOf("train") != -1 || transType.indexOf("metro") != -1) dep.type = TYPE_RAIL;
+        else if (transType.indexOf("bus") != -1) dep.type = TYPE_BUS;
+        else if (transType.indexOf("ferry") != -1) dep.type = TYPE_FERRY;
+        else if (transType.indexOf("lightrail") != -1 || transType.indexOf("light rail") != -1) dep.type = TYPE_LR;
+      }
+      
+      // destination
       if (transport["destination"]["name"].is<const char*>()) {
         dep.destination = transport["destination"]["name"].as<String>();
         dep.destination.replace(" Station", "");
+        dep.destination.replace(" Wharf", "");
         dep.destination.trim();
       }
       
-      // route time (name/number)
+      // route name/number
       if (transport["disassembledName"].is<const char*>()) {
         dep.route = transport["disassembledName"].as<String>();
       } else if (transport["number"].is<const char*>()) {
         dep.route = transport["number"].as<String>();
-      }
-      
-      // classify mode by route name
-      int routeClassify = classifyTransport(dep.route);
-      if (routeClassify != TYPE_OTHER) {
-        dep.type = routeClassify;
       }
       
       // platform
@@ -285,10 +309,10 @@ void getDepartures() {
         dep.platform = transport["platform"].as<String>();
       }
       
-      // clean platform parsing?
+      // clean platform - extract only digits
       if (dep.platform.length() > 0) {
         String cleanPlatform = "";
-        for (int i = 0; i < dep.platform.length(); i++) {
+        for (unsigned int i = 0; i < dep.platform.length(); i++) {
           if (isdigit(dep.platform[i])) {
             cleanPlatform += dep.platform[i];
           }
@@ -299,7 +323,7 @@ void getDepartures() {
       }
     }
     
-    // get departure times, including planned and estimated, to calculate delay
+    // get departure times
     String timeEstimated = "";
     String timePlanned = "";
     
@@ -349,12 +373,13 @@ void getDepartures() {
       dep.valid = true;
     }
     
-    if (dep.valid && dep.destination.length() > 0 && dep.minutesUntil >= 0) {
+    // Only add departures within next 2 hours
+    if (dep.valid && dep.destination.length() > 0 && dep.minutesUntil >= 0 && dep.minutesUntil <= 120) {
       allDepartures[totalCount] = dep;
       totalCount++;
       
-      String typeStr = (dep.type == TYPE_RAIL) ? "TRAIN" : (dep.type == TYPE_BUS) ? "BUS" : "OTHER";
-      Serial.println(typeStr + ": " + dep.route + " to " + dep.destination + " @ " + dep.time + " (in " + dep.minutesUntil + " min) Platform " + dep.platform);
+      String typeStr = (dep.type == TYPE_RAIL) ? "RAIL" : (dep.type == TYPE_BUS) ? "BUS" : (dep.type == TYPE_LR) ? "LR" : (dep.type == TYPE_FERRY) ? "FERRY" : "OTHER";
+      Serial.println(typeStr + ": " + dep.route + " to " + dep.destination + " @ " + dep.time + " (in " + dep.minutesUntil + " min) P" + dep.platform);
     }
   }
   
@@ -369,7 +394,7 @@ void getDepartures() {
     }
   }
   
-  Serial.println("Total parsed: " + String(totalCount));
+  Serial.println("Total parsed (within 2 hours): " + String(totalCount));
 }
 
 void showError(String msg) {
@@ -386,11 +411,15 @@ void displayDepartures() {
   int filteredCount = 0;
   
   for (int i = 0; i < totalCount; i++) {
-    if (displayMode == TYPE_RAIL && allDepartures[i].type == TYPE_RAIL) {
+    if (displayMode == TYPE_ALL) {
+      filtered[filteredCount++] = allDepartures[i];
+    } else if (displayMode == TYPE_RAIL && allDepartures[i].type == TYPE_RAIL) {
       filtered[filteredCount++] = allDepartures[i];
     } else if (displayMode == TYPE_BUS && allDepartures[i].type == TYPE_BUS) {
       filtered[filteredCount++] = allDepartures[i];
-    } else if (displayMode == TYPE_ALL) {
+    } else if (displayMode == TYPE_LR && allDepartures[i].type == TYPE_LR) {
+      filtered[filteredCount++] = allDepartures[i];
+    } else if (displayMode == TYPE_FERRY && allDepartures[i].type == TYPE_FERRY) {
       filtered[filteredCount++] = allDepartures[i];
     }
   }
@@ -398,7 +427,7 @@ void displayDepartures() {
   // display on screen
   oled.fillScreen(BLACK);
   
-  // header - black background with mode-colored text
+  // header with station name and mode
   oled.fillRect(0, 0, 128, 14, BLACK);
   oled.setCursor(2, 3);
   oled.setTextColor(WHITE);
@@ -409,7 +438,7 @@ void displayDepartures() {
   
   // color mode text based on transport type
   int modeColor = WHITE;
-  if (displayMode == TYPE_RAIL) modeColor = CLNSWTL;
+  if (displayMode == TYPE_RAIL) modeColor = CLST;
   else if (displayMode == TYPE_BUS) modeColor = CLBUS;
   else if (displayMode == TYPE_LR) modeColor = CLLR;
   else if (displayMode == TYPE_FERRY) modeColor = CLFERRY;
@@ -417,7 +446,7 @@ void displayDepartures() {
   oled.setTextColor(modeColor);
   oled.println(modeNames[displayMode]);
   
-  // underline instead of blue bar
+  // underline
   oled.drawFastHLine(0, 13, 128, WHITE);
   
   if (filteredCount == 0) {
@@ -436,14 +465,13 @@ void displayDepartures() {
     Departure dep = filtered[i];
     
     String dest = dep.destination;
-    if (dest.length() > 20) {
-      dest = dest.substring(0, 20);
+    if (dest.length() > 18) {
+      dest = dest.substring(0, 18);
     }
     
     // determine line color based on route
     int lineColor = WHITE;
     if (dep.type == TYPE_RAIL) {
-      // rail line colors
       if (dep.route == "T1") lineColor = CLT1;
       else if (dep.route == "T2") lineColor = CLT2;
       else if (dep.route == "T3") lineColor = CLT3;
@@ -453,13 +481,32 @@ void displayDepartures() {
       else if (dep.route == "T7") lineColor = CLT7;
       else if (dep.route == "T8") lineColor = CLT8;
       else if (dep.route == "T9") lineColor = CLT9;
-      else lineColor = CLNSWST;  // default rail color
+      else if (dep.route == "M1") lineColor = CLMETRO;
+      else lineColor = CLST;
     } else if (dep.type == TYPE_BUS) {
       lineColor = CLBUS;
     } else if (dep.type == TYPE_LR) {
-      lineColor = CLLR;
+      if (dep.route == "L1") lineColor = CLL1;
+      else if (dep.route == "L2") lineColor = CLL2;
+      else if (dep.route == "L3") lineColor = CLL3;
+      else if (dep.route == "L4") lineColor = CLL4;
+      else lineColor = CLLR;
     } else if (dep.type == TYPE_FERRY) {
-      lineColor = CLFERRY;
+      if (dep.route == "F1") lineColor = CLF1;
+      else if (dep.route == "F2") lineColor = CLF2;
+      else if (dep.route == "F3") lineColor = CLF3;
+      else if (dep.route == "F4") lineColor = CLF4;
+      else if (dep.route == "F5") lineColor = CLF5;
+      else if (dep.route == "F6") lineColor = CLF6;
+      else if (dep.route == "F7") lineColor = CLF7;
+      else if (dep.route == "F8") lineColor = CLF8;
+      else if (dep.route == "F9") lineColor = CLF9;
+      else if (dep.route == "F10") lineColor = CLSF;
+      else if (dep.route == "SCO") lineColor = CLT4;
+      else if (dep.route == "CCN") lineColor = CLT9;
+      else if (dep.route == "SHL") lineColor = CLT8;
+      else if (dep.route == "BMT") lineColor = CLT1;
+      else lineColor = CLFERRY;
     }
     
     // route number and destination in line color
@@ -475,9 +522,19 @@ void displayDepartures() {
     // time in white
     oled.setCursor(2, yPos + 9);
     oled.setTextColor(WHITE);
-    
+
     if (dep.minutesUntil == 0) {
       oled.print("Now");
+    } else if (dep.minutesUntil >= 60) {
+      int hours = dep.minutesUntil / 60;
+      int mins = dep.minutesUntil % 60;
+      oled.print(hours);
+      oled.print("h");
+      if (mins > 0) {
+        oled.print(" ");
+        oled.print(mins);
+        oled.print("m");
+      }
     } else {
       oled.print(dep.minutesUntil);
       oled.print("m");
