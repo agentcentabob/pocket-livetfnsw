@@ -13,7 +13,7 @@ const char* password = "network password";
 
 // opendata api: insert your key here
 const char* apiKey = "key";
-const char* stopID = "202210";  // Stop ID for Bondi Junction
+const char* stopID = "202210";  // stop id (currently bondi junction)
 
 // oled pins
 #define OLED_SCK   18
@@ -468,12 +468,12 @@ void displayDepartures() {
     
     // platform
     if (dep.platform.length() > 0) {
-      oled.setTextColor(WHITE);
+      oled.setTextColor(GREEN);
       oled.print("  P");
       oled.print(dep.platform);
     } else {
-      oled.setTextColor(MAGENTA);
-      oled.print("  TBA");
+      oled.setTextColor(MAJOR);
+      oled.print("  P?");
     }
     oled.println();
     
