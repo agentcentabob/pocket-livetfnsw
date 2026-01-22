@@ -5,7 +5,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
 #include <time.h>
-#include <colors.h>
+#include "colours.h"
 
 // wifi: insert your wifi login here
 const char* ssid = "network name";        
@@ -34,8 +34,8 @@ const int UTC_OFFSET_HOURS = 11;
 // button debounce and mode
 unsigned long lastButtonPress = 0;
 const unsigned long DEBOUNCE_DELAY = 200;
-int displayMode = 0;  // 0 = Trains, 1 = Buses, 2 = All
-const char* modeNames[] = {"TRAINS", "BUSES", "ALL"};
+int displayMode = 1;
+const char* modeNames[] = {"ALL", "TRAINS", "BUSES", "LR", "FERRY", "OTHER"};
 
 // departure types
 #define TYPE_ALL 0
@@ -85,7 +85,7 @@ String getStationName(const char* stopID) {
 int classifyTransport(String route) {
   if (route.length() > 0) {
     char first = route[0];
-    if (first == 'T' || first == 't') return TYPE_TRAIN;
+    if (first == 'T' || first == 't') return TYPE_RAIL;
     if (isdigit(first)) return TYPE_BUS;
   }
   return TYPE_OTHER;
@@ -164,7 +164,7 @@ void checkButton() {
     unsigned long now = millis();
     if (now - lastButtonPress > DEBOUNCE_DELAY) {
       lastButtonPress = now;
-      displayMode = (displayMode + 1) % 3;
+      displayMode = (displayMode + 1) % 5;
       Serial.println("Mode switched to: " + String(modeNames[displayMode]));
       displayDepartures();
     }
@@ -188,7 +188,7 @@ void getDepartures() {
   Serial.println("\n=== Fetching Departures ===");
   
   http.begin(url);
-  http.addHeader("Authorizsation", String("apikey ") + apiKey);
+  http.addHeader("Authorization", String("apikey ") + apiKey);
   
   int httpCode = http.GET();
   
@@ -246,11 +246,11 @@ void getDepartures() {
     if (event["transportation"].is<JsonObject>()) {
       JsonObject transport = event["transportation"].as<JsonObject>();
       
-      // Check type (train vs bus)
+      // check type (train vs bus)
       if (transport["properties"]["DM_TransportType"].is<const char*>()) {
         String transType = transport["properties"]["DM_TransportType"].as<String>();
         if (transType.indexOf("Train") != -1 || transType.indexOf("train") != -1) {
-          dep.type = TYPE_TRAIN;
+          dep.type = TYPE_RAIL;
         } else if (transType.indexOf("Bus") != -1 || transType.indexOf("bus") != -1) {
           dep.type = TYPE_BUS;
         }
@@ -353,7 +353,7 @@ void getDepartures() {
       allDepartures[totalCount] = dep;
       totalCount++;
       
-      String typeStr = (dep.type == TYPE_TRAIN) ? "TRAIN" : (dep.type == TYPE_BUS) ? "BUS" : "OTHER";
+      String typeStr = (dep.type == TYPE_RAIL) ? "TRAIN" : (dep.type == TYPE_BUS) ? "BUS" : "OTHER";
       Serial.println(typeStr + ": " + dep.route + " to " + dep.destination + " @ " + dep.time + " (in " + dep.minutesUntil + " min) Platform " + dep.platform);
     }
   }
@@ -386,11 +386,11 @@ void displayDepartures() {
   int filteredCount = 0;
   
   for (int i = 0; i < totalCount; i++) {
-    if (displayMode == 0 && allDepartures[i].type == TYPE_TRAIN) {
+    if (displayMode == TYPE_RAIL && allDepartures[i].type == TYPE_RAIL) {
       filtered[filteredCount++] = allDepartures[i];
-    } else if (displayMode == 1 && allDepartures[i].type == TYPE_BUS) {
+    } else if (displayMode == TYPE_BUS && allDepartures[i].type == TYPE_BUS) {
       filtered[filteredCount++] = allDepartures[i];
-    } else if (displayMode == 2) {
+    } else if (displayMode == TYPE_ALL) {
       filtered[filteredCount++] = allDepartures[i];
     }
   }
@@ -398,16 +398,27 @@ void displayDepartures() {
   // display on screen
   oled.fillScreen(BLACK);
   
-  // header with mode indicator
-  oled.fillRect(0, 0, 128, 14, BLUE);
+  // header - black background with mode-colored text
+  oled.fillRect(0, 0, 128, 14, BLACK);
   oled.setCursor(2, 3);
   oled.setTextColor(WHITE);
   oled.setTextSize(1);
   String stationName = getStationName(stopID);
   oled.print(stationName);
   oled.print(" ");
-  oled.setTextColor(YELLOW);
+  
+  // color mode text based on transport type
+  int modeColor = WHITE;
+  if (displayMode == TYPE_RAIL) modeColor = CLNSWTL;
+  else if (displayMode == TYPE_BUS) modeColor = CLBUS;
+  else if (displayMode == TYPE_LR) modeColor = CLLR;
+  else if (displayMode == TYPE_FERRY) modeColor = CLFERRY;
+  
+  oled.setTextColor(modeColor);
   oled.println(modeNames[displayMode]);
+  
+  // underline instead of blue bar
+  oled.drawFastHLine(0, 13, 128, WHITE);
   
   if (filteredCount == 0) {
     oled.setCursor(15, 60);
@@ -429,14 +440,31 @@ void displayDepartures() {
       dest = dest.substring(0, 20);
     }
     
-    // colour based on delay status
-    int color = ONTIME;  // On time
-    if (dep.delayMinutes < 0) color = EARLY;
-    else if (dep.delayMinutes > 0 && dep.delayMinutes <= 2) color = MINOR;
-    else if (dep.delayMinutes > 2) color = MAJOR;
+    // determine line color based on route
+    int lineColor = WHITE;
+    if (dep.type == TYPE_RAIL) {
+      // rail line colors
+      if (dep.route == "T1") lineColor = CLT1;
+      else if (dep.route == "T2") lineColor = CLT2;
+      else if (dep.route == "T3") lineColor = CLT3;
+      else if (dep.route == "T4") lineColor = CLT4;
+      else if (dep.route == "T5") lineColor = CLT5;
+      else if (dep.route == "T6") lineColor = CLT6;
+      else if (dep.route == "T7") lineColor = CLT7;
+      else if (dep.route == "T8") lineColor = CLT8;
+      else if (dep.route == "T9") lineColor = CLT9;
+      else lineColor = CLNSWST;  // default rail color
+    } else if (dep.type == TYPE_BUS) {
+      lineColor = CLBUS;
+    } else if (dep.type == TYPE_LR) {
+      lineColor = CLLR;
+    } else if (dep.type == TYPE_FERRY) {
+      lineColor = CLFERRY;
+    }
     
+    // route number and destination in line color
     oled.setCursor(2, yPos);
-    oled.setTextColor(color);
+    oled.setTextColor(lineColor);
     oled.setTextSize(1);
     if (dep.route.length() > 0) {
       oled.print(dep.route);
@@ -444,10 +472,10 @@ void displayDepartures() {
     }
     oled.println(dest);
     
+    // time in white
     oled.setCursor(2, yPos + 9);
-    oled.setTextColor(color);
+    oled.setTextColor(WHITE);
     
-    // time status
     if (dep.minutesUntil == 0) {
       oled.print("Now");
     } else {
@@ -455,20 +483,25 @@ void displayDepartures() {
       oled.print("m");
     }
     
-    // show delay status
+    // delay in colored brackets
     if (dep.delayMinutes != 0) {
-      if (dep.delayMinutes < 0) {
-        oled.print(" +");
-        oled.print(abs(dep.delayMinutes));
-      } else {
-        oled.print(" -");
-        oled.print(dep.delayMinutes);
+      int delayColor = ONTIME;
+      if (dep.delayMinutes < 0) delayColor = EARLY;
+      else if (dep.delayMinutes > 0 && dep.delayMinutes <= 2) delayColor = MINOR;
+      else if (dep.delayMinutes > 2) delayColor = MAJOR;
+      
+      oled.setTextColor(delayColor);
+      oled.print(" (");
+      if (dep.delayMinutes > 0) {
+        oled.print("+");
       }
+      oled.print(dep.delayMinutes);
+      oled.print(")");
     }
     
     // platform
     if (dep.platform.length() > 0) {
-      oled.setTextColor(GREEN);
+      oled.setTextColor(WHITE);
       oled.print("  P");
       oled.print(dep.platform);
     } else {
