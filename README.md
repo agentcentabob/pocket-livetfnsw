@@ -1,7 +1,7 @@
 # pocket-livetfnsw
-using the free opendata api to make pocket gadgets that provide live data from transport for nsw on an esp 32
+using the free opendata api to make pocket gadgets that provide live data from transport for nsw on an esp 32. *using ai to help me turn my idea into a functional device.
 
-#### working list
+#### project to do list
 - [ ] decide on time formatting: showing departure time, minutes to departure, delay etc.
 - [x] dynamic station name showing in heading, searched through api
 - [ ] complete colour scheme applied to departures based on line, mode
